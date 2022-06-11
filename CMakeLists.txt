@@ -16,8 +16,8 @@ endif(NOT CMAKE_C_STANDARD)
 
 # C++ standard can be overridden when this is used as a sub-project.
 if(NOT CMAKE_CXX_STANDARD)
-  # This project requires C++11.
-  set(CMAKE_CXX_STANDARD 11)
+  # This project requires C++20.
+  set(CMAKE_CXX_STANDARD 20)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 endif(NOT CMAKE_CXX_STANDARD)
@@ -182,6 +182,8 @@ target_sources(leveldb
     "util/filter_policy.cc"
     "util/hash.cc"
     "util/hash.h"
+    "util/io_uring.cc"
+    "util/io_uring.h"
     "util/logging.cc"
     "util/logging.h"
     "util/mutexlock.h"
@@ -280,6 +282,8 @@ endif(HAVE_TCMALLOC)
 # Needed by port_stdcxx.h
 find_package(Threads REQUIRED)
 target_link_libraries(leveldb Threads::Threads)
+
+target_link_libraries(leveldb uring)
 
 add_executable(leveldbutil
   "db/leveldbutil.cc"
