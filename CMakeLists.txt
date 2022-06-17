@@ -347,6 +347,7 @@ if(LEVELDB_BUILD_TESTS)
         "util/coding_test.cc"
         "util/crc32c_test.cc"
         "util/hash_test.cc"
+        "util/io_uring_test.cc"
         "util/logging_test.cc"
     )
   endif(NOT BUILD_SHARED_LIBS)
