@@ -83,6 +83,23 @@ class CondVar {
   Mutex* const mu_;
 };
 
+inline bool Have_Snappy() {
+#ifdef HAVE_SNAPPY
+  return true;
+#else
+  return false;
+#endif
+}
+
+inline bool Snappy_MaxCompressedLength(size_t input_size, size_t* output_size) {
+#if HAVE_SNAPPY
+  *output_size = snappy::MaxCompressedLength(input_size);
+  return true;
+#else
+  return false;
+#endif  // HAVE_SNAPPY
+}
+
 inline bool Snappy_Compress(const char* input, size_t length,
                             std::string* output) {
 #if HAVE_SNAPPY
@@ -99,6 +116,16 @@ inline bool Snappy_Compress(const char* input, size_t length,
 #endif  // HAVE_SNAPPY
 
   return false;
+}
+
+inline bool Snappy_Compress(const char* input, size_t length, char* output,
+                            size_t* output_length) {
+#if HAVE_SNAPPY
+  snappy::RawCompress(input, length, output, output_length);
+  return true;
+#else
+  return false;
+#endif  // HAVE_SNAPPY
 }
 
 inline bool Snappy_GetUncompressedLength(const char* input, size_t length,

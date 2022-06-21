@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fcntl.h>
+#include <mutex>
 
 #include "leveldb/cache.h"
 #include "leveldb/env.h"
@@ -71,6 +72,7 @@ HeapFile::HeapFile(std::string filename, int fd, uint64_t cache_id,
     : filename_(filename),
       fd_(fd),
       cache_id_(cache_id),
+      free_block_count_(0),
       super_block_(super_block) {
   InitFreeBlockList();
 }
@@ -94,12 +96,14 @@ HeapFile::~HeapFile() {
 auto HeapFile::AllocBlocks(uint64_t nbytes) -> Mutation {
   Mutation m;
   uint64_t real_bytes = round_up(nbytes);
-  uint16_t block_count = real_bytes / kHeapBlockSize;
+  uint32_t block_count = real_bytes / kHeapBlockSize;
   size_t free_list_index = CalcFreeListIndex(block_count);
   FreeNode* pos = nullptr;
   FreeNode* prev = nullptr;
-  for (size_t i = free_list_index;
-       i < kFreeListGroupSize && m.start_index != kInvalidBitMapIndex; i++) {
+
+  std::lock_guard<std::mutex> lk(mu_);
+
+  for (size_t i = free_list_index; i < kFreeListGroupSize; i++) {
     prev = &dummys_[i];
     pos = dummys_[i].next;
     while (pos != nullptr) {
@@ -129,11 +133,19 @@ auto HeapFile::AllocBlocks(uint64_t nbytes) -> Mutation {
       pos->next = dummy->next;
       dummy->next = pos;
     }
+    break;
   }
+
+  // if success to alloc blocks, update free block count
+  if (m.start_index != kInvalidBitMapIndex) {
+    free_block_count_ -= m.block_count;
+  }
+
   return m;
 }
 
 auto HeapFile::ReleaseBlocks(const std::vector<Mutation>& mutations) -> void {
+  std::lock_guard<std::mutex> lk(mu_);
   for (const auto& m : mutations) {
     ReleaseBlock(m);
   }
@@ -141,19 +153,23 @@ auto HeapFile::ReleaseBlocks(const std::vector<Mutation>& mutations) -> void {
 
 auto HeapFile::SetBitmapAndFlush(const std::vector<Mutation>& mutations)
     -> void {
+  std::lock_guard<std::mutex> lk(mu_);
   for (auto& m : mutations) {
     for (int i = 0; i < m.block_count; i++) {
       super_block_->Set(m.start_index + i);
     }
   }
   super_block_->SetCheckSum();
-  auto hw = IoUring::Instance().DoIoReq(
-      IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
-            reinterpret_cast<uint8_t*>(super_block_)));
+  {
+    auto hw = IoUring::Instance().DoIoReq(
+        IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
+              reinterpret_cast<uint8_t*>(super_block_)));
+  }
 }
 
 auto HeapFile::UnSetBitmapAndFlush(const std::vector<Mutation>& mutations)
     -> void {
+  std::lock_guard<std::mutex> lk(mu_);
   for (const auto& m : mutations) {
     for (int i = 0; i < m.block_count; i++) {
       super_block_->UnSet(m.start_index + i);
@@ -161,9 +177,11 @@ auto HeapFile::UnSetBitmapAndFlush(const std::vector<Mutation>& mutations)
     ReleaseBlock(m);
   }
   super_block_->SetCheckSum();
-  auto hw = IoUring::Instance().DoIoReq(
-      IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
-            reinterpret_cast<uint8_t*>(super_block_)));
+  {
+    auto hw = IoUring::Instance().DoIoReq(
+        IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
+              reinterpret_cast<uint8_t*>(super_block_)));
+  }
 }
 
 auto HeapFile::InitFreeBlockList() -> void {
@@ -172,13 +190,14 @@ auto HeapFile::InitFreeBlockList() -> void {
     dummys_[i].start_index = kInvalidBitMapIndex;
     dummys_[i].block_count = 0;
   }
-  uint16_t start_index = kInvalidBitMapIndex;
-  uint16_t block_count = 0;
+  uint32_t start_index = kInvalidBitMapIndex;
+  uint32_t block_count = 0;
   for (size_t i = 0; i < 8 * kBitmapSize; i++) {
     if (super_block_->At(i) == 0) {
       // this is a free block
       start_index = start_index == kInvalidBitMapIndex ? i : start_index;
       block_count++;
+      free_block_count_++;
     } else {
       // we meet a used block
       if (start_index == kInvalidBitMapIndex) {
@@ -202,6 +221,9 @@ auto HeapFile::InitFreeBlockList() -> void {
 // ! we can not use bitmap to check because bitmap will not update
 // ! when allocate a free space util all alloc is submit by SetBitmapAndFlush.
 auto HeapFile::ReleaseBlock(const Mutation& mutation) -> void {
+  // update free block count
+  free_block_count_ += mutation.block_count;
+
   FreeNode* prev_free = nullptr;
   FreeNode* next_free = nullptr;
   FreeNode* prev = nullptr;
@@ -248,7 +270,7 @@ auto HeapFile::ReleaseBlock(const Mutation& mutation) -> void {
   dummy->next = new_free_node;
 }
 
-auto HeapFile::CalcFreeListIndex(uint16_t block_count) -> size_t {
+auto HeapFile::CalcFreeListIndex(uint32_t block_count) -> size_t {
   for (size_t i = 0; i < kFreeListGroupSize; i++) {
     if ((1 << i) >= block_count) {
       return i;

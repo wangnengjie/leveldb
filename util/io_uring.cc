@@ -1,6 +1,5 @@
 #include "io_uring.h"
 
-#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +17,7 @@ auto Handle::Init(IoUring* ring, const IoReq& req) -> void {
   done_ = false;
   write_ = req.write;
   fd_ = req.fd;
+  status_ = Status::OK();
   ring_ = ring;
   nbytes_ = req.nbytes;
   offset_ = req.offset;
@@ -68,6 +68,17 @@ HandleWrapper::~HandleWrapper() {
     HandlePool::Release(handle_);
     handle_ = nullptr;
   }
+}
+
+HandleWrapper& HandleWrapper::operator=(HandleWrapper&& hw) {
+  if (handle_ != nullptr) {
+    handle_->Wait();
+    HandlePool::Release(handle_);
+    handle_ = nullptr;
+  }
+  handle_ = hw.handle_;
+  hw.handle_ = nullptr;
+  return *this;
 }
 
 auto HandlePool::Instance() -> HandlePool& {
@@ -243,7 +254,13 @@ auto IoUring::TryPollAndHandleCQE() -> bool {
 
 auto IoUring::HandleCQE(io_uring_cqe* cqe) -> bool {
   Handle* handle = reinterpret_cast<Handle*>(io_uring_cqe_get_data(cqe));
-  assert(cqe->res >= 0);  // TODO: handle error
+  if (cqe->res < 0) {
+    handle->status_ = Status::IOError("io_uring error", strerror(errno));
+    handle->done_ = true;
+    in_flight_--;
+    return false;
+  }
+  // assert(cqe->res >= 0);  // TODO: handle error
   handle->Update(cqe->res);
   if (handle->Done()) {
     // don't release handle here, it will be released when HandleWrapper drop

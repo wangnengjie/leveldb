@@ -9,6 +9,8 @@
 #include <mutex>
 #include <vector>
 
+#include "leveldb/status.h"
+
 namespace leveldb {
 
 static const size_t kHandlePoolSize = 1024;
@@ -35,6 +37,7 @@ class Handle {
   bool fixed_ = false;
   bool write_ = false;
   int fd_ = 0;
+  Status status_;
   Handle* next_ = nullptr;
   IoUring* ring_ = nullptr;
   uint64_t nbytes_ = 0;
@@ -54,6 +57,7 @@ class Handle {
   auto IsWrite() const -> bool { return write_; }
   auto Done() const -> bool { return done_; }
   auto Size() const -> uint64_t { return ptr_ - buf_; };
+  auto status() const -> Status { return status_; }
 };
 
 class HandleWrapper {
@@ -67,8 +71,10 @@ class HandleWrapper {
 
   HandleWrapper(const HandleWrapper&) = delete;
   HandleWrapper& operator=(const HandleWrapper&) = delete;
+  HandleWrapper& operator=(HandleWrapper&&);
 
   auto Get() -> Handle& { return *handle_; }
+  auto Done() const -> bool { return handle_ == nullptr || handle_->Done(); }
 };
 
 class HandlePool {

@@ -26,9 +26,10 @@ static const uint64_t kBitmapSize = kHeapBlockSize - sizeof(uint32_t);
 static const uint64_t kHeapFileSize = kHeapBlockSize * (1 + 8 * kBitmapSize);
 // super block is at the end of the file
 static const uint64_t kSuperBlockOffset = kHeapBlockSize * 8 * kBitmapSize;
-// for 4092 bytes bitmap, uint16_t is enough
-static const uint16_t kInvalidBitMapIndex =
-    std::numeric_limits<uint16_t>::max();
+// for 4092 bytes bitmap, uint32_t is enough (we might increase file size in the
+// future so 16bit is not enough)
+static const uint32_t kInvalidBitMapIndex =
+    std::numeric_limits<uint32_t>::max();
 
 static const uint64_t kInvalidOffset = std::numeric_limits<uint64_t>::max();
 
@@ -55,13 +56,13 @@ struct SuperBlock {
   auto SetCheckSum() -> void {
     EncodeFixed32(reinterpret_cast<char*>(&crc), crc32c::Mask(CalcCheckSum()));
   }
-  auto At(uint16_t index) const -> uint8_t {
+  auto At(uint32_t index) const -> uint8_t {
     return !!(bitmap[index >> 3] & (1 << (7 - index & 0x7)));
   }
-  auto Set(uint16_t index) -> void {
+  auto Set(uint32_t index) -> void {
     bitmap[index >> 3] |= (1 << (7 - index & 0x7));
   }
-  auto UnSet(uint16_t index) -> void {
+  auto UnSet(uint32_t index) -> void {
     bitmap[index >> 3] &= ~(1 << (7 - index & 0x7));
   }
 };
@@ -72,12 +73,12 @@ class HeapFile {
     friend class HeapFile;
 
    private:
-    uint16_t start_index;
-    uint16_t block_count;
+    uint32_t start_index;
+    uint32_t block_count;
 
    public:
-    Mutation(uint16_t start_index = kInvalidBitMapIndex,
-             uint16_t block_count = 0)
+    Mutation(uint32_t start_index = kInvalidBitMapIndex,
+             uint32_t block_count = 0)
         : start_index(start_index), block_count(block_count) {}
     auto Offset() const -> uint64_t {
       return start_index == kInvalidBitMapIndex ? kInvalidOffset
@@ -93,11 +94,11 @@ class HeapFile {
   struct FreeNode {
     FreeNode* next;
     // free block index in bitmap
-    uint16_t start_index;
+    uint32_t start_index;
     // how much free blocks start from start_index
-    uint16_t block_count;
-    FreeNode(uint16_t start_index = kInvalidBitMapIndex,
-             uint16_t block_count = 0)
+    uint32_t block_count;
+    FreeNode(uint32_t start_index = kInvalidBitMapIndex,
+             uint32_t block_count = 0)
         : next(nullptr), start_index(start_index), block_count(block_count) {}
     auto Size() const -> uint64_t { return block_count * kHeapBlockSize; }
   };
@@ -106,6 +107,7 @@ class HeapFile {
   std::mutex mu_;
   std::string filename_;
   int fd_;
+  uint32_t free_block_count_;
   uint64_t cache_id_;
   // we don't alloc it as array here as it should be posix_memalign
   SuperBlock* super_block_;
@@ -123,31 +125,26 @@ class HeapFile {
   HeapFile(HeapFile&&) = delete;
   HeapFile(const HeapFile&) = delete;
   ~HeapFile();
-  auto Lock() -> void { mu_.lock(); }
-  auto Unlock() -> void { mu_.unlock(); }
   auto Filename() const -> const std::string& { return filename_; }
   auto Fd() const -> int { return fd_; }
   auto CacheId() const -> uint64_t { return cache_id_; }
+  auto FreeBlockCount() const -> uint32_t { return free_block_count_; }
   // auto SuperBlock() const -> const SuperBlock* { return super_block_; }
 
-  // this is not thread safe, caller should lock.
   // will modify: **free list**
   //
   // this is for flush job to allocate blocks for values.
   // return the offset and size of the allocated blocks.
   // offset will be set to kInvalidOffset if no block is allocated.
   auto AllocBlocks(uint64_t nbytes) -> Mutation;
-  // this is not thread safe, caller should lock.
   // will modify: **free list**
   //
   // this is for failed flush job to release allocated blocks.
   auto ReleaseBlocks(const std::vector<Mutation>& mutations) -> void;
-  // this is not thread safe, caller should lock.
   // will modify: **super block**
   //
   // this is for flush job to submit changes
   auto SetBitmapAndFlush(const std::vector<Mutation>& mutations) -> void;
-  // this is not thread safe, caller should lock.
   // will modify: **free list**, **super block**
   //
   // for compaction to remove values.
@@ -159,7 +156,7 @@ class HeapFile {
   auto InitFreeBlockList() -> void;
   // release related blocks to free list.
   auto ReleaseBlock(const Mutation& mutation) -> void;
-  static auto CalcFreeListIndex(uint16_t block_count) -> size_t;
+  static auto CalcFreeListIndex(uint32_t block_count) -> size_t;
 };
 }  // namespace leveldb
 
