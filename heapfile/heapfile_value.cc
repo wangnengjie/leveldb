@@ -45,6 +45,7 @@ static auto MaxEncodedLength(const Options& options, size_t source_bytes)
       port::Snappy_MaxCompressedLength(source_bytes, &mcl);
       return std::max(raw, kHFValueHeaderSize + mcl);
   }
+  return raw;
 }
 
 static auto EncodeHFValue(const Options& options, const Slice& value,
@@ -54,10 +55,15 @@ static auto EncodeHFValue(const Options& options, const Slice& value,
   if (!port::Have_Snappy() && t == kSnappyCompression) {
     t = kNoCompression;
   }
+  size_t raw_size = kHFValueHeaderSize + value.size();
+  if (raw_size <= kHeapBlockSize) {
+    t = kNoCompression;
+  }
+
   size_t size;
   switch (t) {
     case kNoCompression: {
-      size = kHFValueHeaderSize + value.size();
+      size = raw_size;
       buf[4] = t;
       EncodeFixed64(reinterpret_cast<char*>(buf + 5), value.size());
       memcpy(buf + kHFValueHeaderSize, value.data(), value.size());
@@ -67,7 +73,7 @@ static auto EncodeHFValue(const Options& options, const Slice& value,
       port::Snappy_Compress(value.data(), value.size(),
                             reinterpret_cast<char*>(buf + kHFValueHeaderSize),
                             &size);
-      if (size < value.size() - (value.size() / 8u)) {
+      if (round_up(size + kHFValueHeaderSize) < round_up(raw_size)) {
         buf[4] = t;
         EncodeFixed64(reinterpret_cast<char*>(buf + 5), size);
         size += kHFValueHeaderSize;
