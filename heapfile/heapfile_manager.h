@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -26,6 +27,7 @@ class HeapFileManager {
   const Options& options_;
   mutable std::mutex mu_;
   std::unordered_map<uint64_t, std::unique_ptr<HeapFile>> hfs_map_;
+  mutable std::mutex vec_mu_;
   std::vector<HeapFile*> hfs_vec_;
   uint64_t next_txn_id_;
 
@@ -72,15 +74,21 @@ enum class TxnStatus : uint8_t {
 
 class HeapFileManager::FlushTxn {
  private:
+  struct IoBuf {
+    size_t size;
+    uint8_t* buf;  // aligned memory
+  };
+
+ private:
   uint64_t txn_id_;
   HeapFileManager* hfm_;
   std::unordered_map<uint64_t, std::vector<Mutation>> mutations_;
   HeapFile* pinned_hf_;
   std::vector<HandleWrapper> submit_handles_;
-  std::vector<IoReq> pending_batch_;
-  std::vector<IoReq> cur_batch_;
-  uint32_t cur_batch_io_count_;
-  uint32_t batch_count_;
+  std::vector<IoReq> batch_;
+  std::vector<IoBuf> io_bufs_;
+  uint64_t io_count_;
+  const uint32_t batch_size_;
   TxnStatus status_;
 
  public:
@@ -89,14 +97,30 @@ class HeapFileManager::FlushTxn {
   auto Add(Slice& s, HFValueMeta& value_meta) -> Status;
   auto Commit() -> Status;
   auto Abort() -> Status;
-  auto EncodeMutation(std::string& s) const -> void;
+  // auto EncodeMutation(std::string& s) const -> void;
 
  private:
+  auto SubmitBatch() -> Status;
+  // caller make sure the size is kHeapBlockSize aligned
+  auto FindSpace(size_t size) -> Mutation;
+  auto WaitPrevBatch() -> Status;
+  // caller make sure the size is kHeapBlockSize aligned
+  auto PrepareBuf(size_t index, size_t size) -> Status;
 };
 
 class HeapFileManager::CompactTxn {
+ private:
+  uint64_t txn_id_;
+  HeapFileManager* hfm_;
+  std::unordered_map<uint64_t, std::vector<Mutation>> mutations_;
+  TxnStatus status_;
+
  public:
   CompactTxn(HeapFileManager* hfm);
+  ~CompactTxn();
+  auto Remove(const HFValueMeta& value_meta) -> void;
+  auto Commit() -> Status;
+  auto Abort() -> Status;
 };
 
 }  // namespace leveldb

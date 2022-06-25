@@ -1,5 +1,6 @@
 #include "heapfile.h"
 
+#include "db/filename.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -13,11 +14,13 @@
 #include "util/io_uring.h"
 
 namespace leveldb {
-auto HeapFile::Open(const Options* options, std::string filename,
-                    std::unique_ptr<HeapFile>* heap_file) -> Status {
+auto HeapFile::Open(const Options* options, const std::string& dbname,
+                    uint64_t file_number, std::unique_ptr<HeapFile>* heap_file)
+    -> Status {
   int fd = -1;
   int ret = 0;
   bool exist = true;
+  std::string filename = HeapFileName(dbname, file_number);
   if (!options->env->FileExists(filename)) {
     exist = false;
     fd = ::open(filename.c_str(), O_CREAT | O_RDWR | O_DIRECT | O_SYNC, 0644);
@@ -62,14 +65,14 @@ auto HeapFile::Open(const Options* options, std::string filename,
   }
 
   *heap_file = std::unique_ptr<HeapFile>(
-      new HeapFile(filename, fd, cache_id, super_block));
+      new HeapFile(file_number, fd, cache_id, super_block));
 
   return Status::OK();
 }
 
-HeapFile::HeapFile(std::string filename, int fd, uint64_t cache_id,
+HeapFile::HeapFile(uint64_t file_number, int fd, uint64_t cache_id,
                    SuperBlock* super_block)
-    : filename_(filename),
+    : file_number_(file_number),
       fd_(fd),
       cache_id_(cache_id),
       free_block_count_(0),
@@ -152,7 +155,7 @@ auto HeapFile::ReleaseBlocks(const std::vector<Mutation>& mutations) -> void {
 }
 
 auto HeapFile::SetBitmapAndFlush(const std::vector<Mutation>& mutations)
-    -> void {
+    -> Status {
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& m : mutations) {
     for (int i = 0; i < m.block_count; i++) {
@@ -160,15 +163,16 @@ auto HeapFile::SetBitmapAndFlush(const std::vector<Mutation>& mutations)
     }
   }
   super_block_->SetCheckSum();
-  {
-    auto hw = IoUring::Instance().DoIoReq(
-        IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
-              reinterpret_cast<uint8_t*>(super_block_)));
-  }
+
+  auto hw = IoUring::Instance().DoIoReq(
+      IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
+            reinterpret_cast<uint8_t*>(super_block_)));
+  hw.Get().Wait();
+  return hw.Get().status();
 }
 
 auto HeapFile::UnSetBitmapAndFlush(const std::vector<Mutation>& mutations)
-    -> void {
+    -> Status {
   std::lock_guard<std::mutex> lk(mu_);
   for (const auto& m : mutations) {
     for (int i = 0; i < m.block_count; i++) {
@@ -177,11 +181,12 @@ auto HeapFile::UnSetBitmapAndFlush(const std::vector<Mutation>& mutations)
     ReleaseBlock(m);
   }
   super_block_->SetCheckSum();
-  {
-    auto hw = IoUring::Instance().DoIoReq(
-        IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
-              reinterpret_cast<uint8_t*>(super_block_)));
-  }
+
+  auto hw = IoUring::Instance().DoIoReq(
+      IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
+            reinterpret_cast<uint8_t*>(super_block_)));
+  hw.Get().Wait();
+  return hw.Get().status();
 }
 
 auto HeapFile::InitFreeBlockList() -> void {

@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "leveldb/options.h"
@@ -33,12 +34,14 @@ static const uint32_t kInvalidBitMapIndex =
 
 static const uint64_t kInvalidOffset = std::numeric_limits<uint64_t>::max();
 
+template <const size_t N = kHeapBlockSize>
 static inline auto round_up(uint64_t nbytes) -> uint64_t {
-  return (nbytes + kHeapBlockSize - 1) & ~(kHeapBlockSize - 1);
+  return (nbytes + N - 1) & ~(N - 1);
 }
 
+template <const size_t N = kHeapBlockSize>
 static inline auto round_down(uint64_t nbytes) -> uint64_t {
-  return nbytes & ~(kHeapBlockSize - 1);
+  return nbytes & ~(N - 1);
 }
 
 class HeapFile;
@@ -80,6 +83,8 @@ class HeapFile {
     Mutation(uint32_t start_index = kInvalidBitMapIndex,
              uint32_t block_count = 0)
         : start_index(start_index), block_count(block_count) {}
+    auto StartIndex() const -> uint32_t { return start_index; }
+    auto BlockCount() const -> uint32_t { return block_count; }
     auto Offset() const -> uint64_t {
       return start_index == kInvalidBitMapIndex ? kInvalidOffset
                                                 : start_index * kHeapBlockSize;
@@ -105,7 +110,7 @@ class HeapFile {
 
  private:
   std::mutex mu_;
-  std::string filename_;
+  uint64_t file_number_;
   int fd_;
   uint32_t free_block_count_;
   uint64_t cache_id_;
@@ -118,14 +123,15 @@ class HeapFile {
   FreeNode dummys_[kFreeListGroupSize];
 
  public:
-  static auto Open(const Options* options, std::string filename,
-                   std::unique_ptr<HeapFile>* heap_file) -> Status;
+  static auto Open(const Options* options, const std::string& dbname,
+                   uint64_t file_number, std::unique_ptr<HeapFile>* heap_file)
+      -> Status;
 
  public:
   HeapFile(HeapFile&&) = delete;
   HeapFile(const HeapFile&) = delete;
   ~HeapFile();
-  auto Filename() const -> const std::string& { return filename_; }
+  auto FileNumber() const -> uint64_t { return file_number_; }
   auto Fd() const -> int { return fd_; }
   auto CacheId() const -> uint64_t { return cache_id_; }
   auto FreeBlockCount() const -> uint32_t { return free_block_count_; }
@@ -144,14 +150,14 @@ class HeapFile {
   // will modify: **super block**
   //
   // this is for flush job to submit changes
-  auto SetBitmapAndFlush(const std::vector<Mutation>& mutations) -> void;
+  auto SetBitmapAndFlush(const std::vector<Mutation>& mutations) -> Status;
   // will modify: **free list**, **super block**
   //
   // for compaction to remove values.
-  auto UnSetBitmapAndFlush(const std::vector<Mutation>& mutations) -> void;
+  auto UnSetBitmapAndFlush(const std::vector<Mutation>& mutations) -> Status;
 
  private:
-  HeapFile(std::string filename, int fd, uint64_t cache_id,
+  HeapFile(uint64_t file_number, int fd, uint64_t cache_id,
            SuperBlock* super_block);
   auto InitFreeBlockList() -> void;
   // release related blocks to free list.

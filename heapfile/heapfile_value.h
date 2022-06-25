@@ -25,13 +25,13 @@ struct HFValueMeta {
 // value format:
 // | crc32 (4B) | type (1B) | uint64(8B) | encoded value |
 
-static auto MaxEncodedLength(const Options& options, size_t source_bytes)
+auto HFValueMaxEncodedLength(const Options& options, size_t source_bytes)
     -> size_t;
 
-static auto EncodeHFValue(const Options& options, const Slice& value,
-                          uint8_t* buf, size_t* output_size) -> Status;
+auto EncodeHFValue(const Options& options, const Slice& value, uint8_t* buf,
+                   size_t* output_size) -> Status;
 
-static auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
+auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
     -> Status;
 }  // namespace leveldb
 

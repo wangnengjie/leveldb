@@ -31,7 +31,7 @@ auto HFValueMeta::EncodeTo(std::string& s) const -> void {
   PutVarint32(&s, block_count);
 }
 
-static auto MaxEncodedLength(const Options& options, size_t source_bytes)
+auto HFValueMaxEncodedLength(const Options& options, size_t source_bytes)
     -> size_t {
   size_t raw = kHFValueHeaderSize + source_bytes;
   switch (options.compression) {
@@ -48,8 +48,8 @@ static auto MaxEncodedLength(const Options& options, size_t source_bytes)
   return raw;
 }
 
-static auto EncodeHFValue(const Options& options, const Slice& value,
-                          uint8_t* buf, size_t* output_size) -> Status {
+auto EncodeHFValue(const Options& options, const Slice& value, uint8_t* buf,
+                   size_t* output_size) -> Status {
   CompressionType t = options.compression;
   // TODO: support other compression type
   if (!port::Have_Snappy() && t == kSnappyCompression) {
@@ -92,7 +92,7 @@ static auto EncodeHFValue(const Options& options, const Slice& value,
   return Status::OK();
 }
 
-static auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
+auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
     -> Status {
   uint64_t len = DecodeFixed64(reinterpret_cast<const char*>(value + 5));
 
