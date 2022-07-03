@@ -4,20 +4,30 @@
 
 #include "db/version_set.h"
 
-#include <algorithm>
-#include <cstdio>
-
+#include "db/dbformat.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
 #include "leveldb/env.h"
+#include "leveldb/status.h"
 #include "leveldb/table_builder.h"
+
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/logging.h"
+
+#include "heapfile/heapfile.h"
+#include "heapfile/heapfile_manager.h"
+#include "heapfile/heapfile_value.h"
 
 namespace leveldb {
 
@@ -257,6 +267,7 @@ struct Saver {
   const Comparator* ucmp;
   Slice user_key;
   std::string* value;
+  HeapFileManager* heapfile_manager;
 };
 }  // namespace
 static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
@@ -266,9 +277,24 @@ static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
     s->state = kCorrupt;
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
-      s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+      s->state =
+          (parsed_key.type == kTypeValue || parsed_key.type == kTypeHFValue)
+              ? kFound
+              : kDeleted;
       if (s->state == kFound) {
-        s->value->assign(v.data(), v.size());
+        if (parsed_key.type == kTypeValue) {
+          s->value->assign(v.data(), v.size());
+        } else if (parsed_key.type == kTypeHFValue) {
+          // s->value->assign(v.data(), v.size());
+          HFValueMeta meta;
+          Slice hf_value(v);
+          meta.DecodeFrom(hf_value);
+          Status status =
+              s->heapfile_manager->ReadDecodedValueSync(meta, *s->value);
+          if (!status.ok()) {
+            s->state = kCorrupt;
+          }
+        }
       }
     }
   }
@@ -393,6 +419,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   state.saver.ucmp = vset_->icmp_.user_comparator();
   state.saver.user_key = k.user_key();
   state.saver.value = value;
+  state.saver.heapfile_manager = vset_->heapfile_manager_;
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
 
@@ -732,11 +759,13 @@ class VersionSet::Builder {
 
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
                        TableCache* table_cache,
+                       HeapFileManager* heapfile_manager,
                        const InternalKeyComparator* cmp)
     : env_(options->env),
       dbname_(dbname),
       options_(options),
       table_cache_(table_cache),
+      heapfile_manager_(heapfile_manager),
       icmp_(*cmp),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()

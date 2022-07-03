@@ -8,17 +8,25 @@
 #include "db/filename.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
+#include <cassert>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/iterator.h"
 
+#include "heapfile/heapfile_manager.h"
+#include "heapfile/heapfile_value.h"
+
 namespace leveldb {
 
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta) {
+                  TableCache* table_cache, HeapFileManager* heapfile_manager,
+                  Iterator* iter, FileMetaData* meta, bool is_flush) {
   Status s;
   meta->file_size = 0;
   iter->SeekToFirst();
+
+  HeapFileManager::FlushTxn txn = heapfile_manager->NewFlushTxn();
 
   std::string fname = TableFileName(dbname, meta->number);
   if (iter->Valid()) {
@@ -28,12 +36,37 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
       return s;
     }
 
+    InternalKey k;
+    ParsedInternalKey ikey;
+    HFValueMeta value_meta;
+    std::string hf_value;
+
     TableBuilder* builder = new TableBuilder(options, file);
-    meta->smallest.DecodeFrom(iter->key());
+
     Slice key;
-    for (; iter->Valid(); iter->Next()) {
-      key = iter->key();
-      builder->Add(key, iter->value());
+    for (size_t count = 0; iter->Valid(); iter->Next()) {
+      if (is_flush &&
+          iter->value().size() >= options.separate_value_threshold) {
+        ParseInternalKey(iter->key(), &ikey);
+        ikey.type = kTypeHFValue;
+        k.SetFrom(ikey);
+        key = k.Encode();
+        s = txn.Add(iter->value(), value_meta);
+        assert(s.ok());  //! just for debug, will remove later
+        // if (!s.ok()) {
+        //   txn.Abort();
+        // }
+        value_meta.EncodeTo(hf_value);
+        builder->Add(key, Slice(hf_value));
+        hf_value.clear();
+      } else {
+        key = iter->key();
+        builder->Add(key, iter->value());
+      }
+      count++;
+      if (count == 1) {
+        meta->smallest.DecodeFrom(key);
+      }
     }
     if (!key.empty()) {
       meta->largest.DecodeFrom(key);
@@ -73,7 +106,13 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
   if (s.ok() && meta->file_size > 0) {
     // Keep it
+    s = txn.Commit();
+    if (!s.ok()) {
+      txn.Abort();
+      env->RemoveFile(fname);
+    }
   } else {
+    txn.Abort();
     env->RemoveFile(fname);
   }
   return s;

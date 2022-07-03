@@ -5,18 +5,21 @@
 #ifndef STORAGE_LEVELDB_DB_DB_IMPL_H_
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
+#include "db/dbformat.h"
+#include "db/log_writer.h"
+#include "db/snapshot.h"
 #include <atomic>
 #include <deque>
 #include <set>
 #include <string>
 
-#include "db/dbformat.h"
-#include "db/log_writer.h"
-#include "db/snapshot.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
+
+#include "heapfile/heapfile_manager.h"
 
 namespace leveldb {
 
@@ -166,6 +169,8 @@ class DBImpl : public DB {
 
   // table_cache_ provides its own synchronization
   TableCache* const table_cache_;
+
+  HeapFileManager* const heapfile_manager_;
 
   // Lock over the persistent DB state.  Non-null iff successfully acquired.
   FileLock* db_lock_;

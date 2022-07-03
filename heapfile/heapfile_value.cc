@@ -17,12 +17,10 @@
 
 namespace leveldb {
 
-auto HFValueMeta::DecodeFrom(Slice& s) -> HFValueMeta {
-  HFValueMeta meta;
-  GetVarint64(&s, &meta.file_number);
-  GetVarint32(&s, &meta.start_index);
-  GetVarint32(&s, &meta.block_count);
-  return meta;
+auto HFValueMeta::DecodeFrom(Slice& s) -> void {
+  GetVarint64(&s, &file_number);
+  GetVarint32(&s, &start_index);
+  GetVarint32(&s, &block_count);
 }
 
 auto HFValueMeta::EncodeTo(std::string& s) const -> void {
@@ -92,7 +90,25 @@ auto EncodeHFValue(const Options& options, const Slice& value, uint8_t* buf,
   return Status::OK();
 }
 
-auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
+auto GetHFValueDecodeLength(const uint8_t* value, size_t* size) -> Status {
+  CompressionType t = static_cast<CompressionType>(value[4]);
+  switch (t) {
+    case kNoCompression:
+      *size = DecodeFixed64(reinterpret_cast<const char*>(value + 5));
+      return Status::OK();
+    case kSnappyCompression:
+      if (!port::Snappy_GetUncompressedLength(
+              reinterpret_cast<const char*>(value + kHFValueHeaderSize),
+              DecodeFixed64(reinterpret_cast<const char*>(value + 5)), size)) {
+        return Status::Corruption("corrupted compressed heapfile value");
+      }
+
+      return Status::OK();
+  }
+  return Status::Corruption("unknown compression type");
+}
+
+auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t* output)
     -> Status {
   uint64_t len = DecodeFixed64(reinterpret_cast<const char*>(value + 5));
 
@@ -101,32 +117,31 @@ auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
   uint32_t actual_crc = crc32c::Value(reinterpret_cast<const char*>(value + 4),
                                       kHFValueHeaderSize - 4 + len);
   if (actual_crc != expected_crc) {
-    return Status::Corruption("corrupted");
+    return Status::Corruption("corrupted heapfile value");
   }
 
   CompressionType t = static_cast<CompressionType>(value[4]);
   size_t size;
   switch (t) {
     case kNoCompression: {
-      *output = new uint8_t[len];
-      memcpy(*output, value + kHFValueHeaderSize, len);
+      memcpy(output, value + kHFValueHeaderSize, len);
       break;
     }
     case kSnappyCompression: {
       if (!port::Have_Snappy()) {
-        return Status::Corruption("corrupted value");
+        return Status::Corruption("corrupted compressed heapfile value");
       }
       size_t uncompressed_length;
       if (!port::Snappy_GetUncompressedLength(
               reinterpret_cast<const char*>(value + kHFValueHeaderSize), len,
               &uncompressed_length)) {
-        return Status::Corruption("corrupted value");
+        return Status::Corruption("corrupted compressed heapfile value");
       }
-      *output = new uint8_t[uncompressed_length];
+      // *output = new uint8_t[uncompressed_length];
       if (!port::Snappy_Uncompress(
               reinterpret_cast<const char*>(value + kHFValueHeaderSize), len,
-              reinterpret_cast<char*>(*output))) {
-        return Status::Corruption("corrupted value");
+              reinterpret_cast<char*>(output))) {
+        return Status::Corruption("corrupted compressed heapfile value");
       }
       break;
     }

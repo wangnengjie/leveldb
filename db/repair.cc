@@ -34,9 +34,12 @@
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
+
 #include "leveldb/comparator.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
+#include "heapfile/heapfile_manager.h"
 
 namespace leveldb {
 
@@ -55,10 +58,12 @@ class Repairer {
         next_file_number_(1) {
     // TableCache can be small since we expect each table to be opened once.
     table_cache_ = new TableCache(dbname_, options_, 10);
+    heapfile_manager_ = new HeapFileManager(dbname_, env_, options_);
   }
 
   ~Repairer() {
     delete table_cache_;
+    delete heapfile_manager_;
     if (owns_info_log_) {
       delete options_.info_log;
     }
@@ -203,7 +208,8 @@ class Repairer {
     FileMetaData meta;
     meta.number = next_file_number_++;
     Iterator* iter = mem->NewIterator();
-    status = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    status = BuildTable(dbname_, env_, options_, table_cache_,
+                        heapfile_manager_, iter, &meta, true);
     delete iter;
     mem->Unref();
     mem = nullptr;
@@ -433,6 +439,7 @@ class Repairer {
   bool owns_info_log_;
   bool owns_cache_;
   TableCache* table_cache_;
+  HeapFileManager* heapfile_manager_;
   VersionEdit edit_;
 
   std::vector<std::string> manifests_;

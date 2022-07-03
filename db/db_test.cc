@@ -1941,6 +1941,16 @@ TEST_F(DBTest, BloomFilter) {
   delete options.filter_policy;
 }
 
+TEST_F(DBTest, HeapFile) {
+  for (int i = 0; i < 100; i++) {
+    ASSERT_LEVELDB_OK(Put(Key(i), std::string(4000, '0')));
+  }
+  dbfull()->TEST_CompactMemTable();
+  for (int i = 0; i < 100; i++) {
+    ASSERT_EQ(std::string(4000, '0'), Get(Key(i)));
+  }
+}
+
 // Multi-threaded test:
 namespace {
 

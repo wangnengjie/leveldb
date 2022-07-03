@@ -18,7 +18,7 @@ struct HFValueMeta {
   uint64_t file_number;
   uint32_t start_index;
   uint32_t block_count;
-  auto DecodeFrom(Slice& s) -> HFValueMeta;
+  auto DecodeFrom(Slice& s) -> void;
   auto EncodeTo(std::string& s) const -> void;
 };
 
@@ -31,7 +31,9 @@ auto HFValueMaxEncodedLength(const Options& options, size_t source_bytes)
 auto EncodeHFValue(const Options& options, const Slice& value, uint8_t* buf,
                    size_t* output_size) -> Status;
 
-auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t** output)
+auto GetHFValueDecodeLength(const uint8_t* value, size_t* size) -> Status;
+
+auto DecodeHFValue(const uint8_t* value, size_t length, uint8_t* output)
     -> Status;
 }  // namespace leveldb
 

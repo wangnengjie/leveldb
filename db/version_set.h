@@ -15,14 +15,16 @@
 #ifndef STORAGE_LEVELDB_DB_VERSION_SET_H_
 #define STORAGE_LEVELDB_DB_VERSION_SET_H_
 
+#include "db/dbformat.h"
+#include "db/version_edit.h"
 #include <map>
 #include <set>
 #include <vector>
 
-#include "db/dbformat.h"
-#include "db/version_edit.h"
 #include "port/port.h"
 #include "port/thread_annotations.h"
+
+#include "heapfile/heapfile_manager.h"
 
 namespace leveldb {
 
@@ -167,7 +169,8 @@ class Version {
 class VersionSet {
  public:
   VersionSet(const std::string& dbname, const Options* options,
-             TableCache* table_cache, const InternalKeyComparator*);
+             TableCache* table_cache, HeapFileManager* heapfile_manager,
+             const InternalKeyComparator*);
   VersionSet(const VersionSet&) = delete;
   VersionSet& operator=(const VersionSet&) = delete;
 
@@ -297,6 +300,7 @@ class VersionSet {
   const std::string dbname_;
   const Options* const options_;
   TableCache* const table_cache_;
+  HeapFileManager* const heapfile_manager_;
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;

@@ -11,8 +11,7 @@ namespace leveldb {
 
 TEST(io_uring, ReadWriteFile) {
   // int fd = open("/tmp/io_uring_test", O_CREAT | O_RDWR, 0644);
-  int fd =
-      ::open("./io_uring_test", O_CREAT | O_RDWR | O_DIRECT | O_SYNC, 0644);
+  int fd = ::open("./io_uring_test", O_CREAT | O_RDWR | O_DIRECT, 0644);
   ASSERT_GT(fd, 0);
   // fallocate(fd, 0, 0, 8192);
   assert(fd > 0);
@@ -32,6 +31,17 @@ TEST(io_uring, ReadWriteFile) {
         IoUring::Instance().DoIoReq(IoReq(true, fd, 4096, 8192, buf1));
     auto handle2 =
         IoUring::Instance().DoIoReq(IoReq(true, fd, 4096, 12288, buf2));
+    // start time
+    auto start = std::chrono::system_clock::now();
+    handle1->Wait();
+    handle2->Wait();
+    // end time
+    auto end = std::chrono::system_clock::now();
+    // print double seconds
+    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                       start)
+                     .count()
+              << " ms" << std::endl;
   }
   memset(buf1, 0, 4096);
   memset(buf2, 0, 4096);
@@ -40,6 +50,17 @@ TEST(io_uring, ReadWriteFile) {
         IoUring::Instance().DoIoReq(IoReq(false, fd, 4096, 8192, buf1));
     auto handle2 =
         IoUring::Instance().DoIoReq(IoReq(false, fd, 4096, 12288, buf2));
+    // start time
+    auto start = std::chrono::system_clock::now();
+    handle1->Wait();
+    handle2->Wait();
+    // end time
+    auto end = std::chrono::system_clock::now();
+    // print double seconds
+    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                       start)
+                     .count()
+              << " ms" << std::endl;
   }
   ::close(fd);
   for (int i = 0; i < 4095; i++) {

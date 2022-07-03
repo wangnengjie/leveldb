@@ -33,17 +33,15 @@ class Handle {
   friend class IoUring;
 
  private:
-  bool done_ = false;
-  bool fixed_ = false;
-  bool write_ = false;
-  int fd_ = 0;
+  bool done_;
+  bool write_;
+  int fd_;
   Status status_;
-  Handle* next_ = nullptr;
-  IoUring* ring_ = nullptr;
-  uint64_t nbytes_ = 0;
-  uint64_t offset_ = 0;
-  uint8_t* buf_ = nullptr;
-  uint8_t* ptr_ = nullptr;
+  IoUring* ring_;
+  uint64_t nbytes_;
+  uint64_t offset_;
+  uint8_t* buf_;
+  uint8_t* ptr_;
 
  private:
   auto Init(IoUring* ring, const IoReq& req) -> void;
@@ -51,6 +49,15 @@ class Handle {
   auto PrepSqe(io_uring_sqe* sqe) -> void;
 
  public:
+  Handle()
+      : done_(false),
+        write_(false),
+        fd_(0),
+        ring_(nullptr),
+        nbytes_(0),
+        offset_(0),
+        buf_(nullptr),
+        ptr_(nullptr){};
   auto Wait() -> void;
   auto Buffer() -> uint8_t* { return buf_; };
   auto Buffer() const -> const uint8_t* { return buf_; };
@@ -65,34 +72,30 @@ class HandleWrapper {
   Handle* handle_ = nullptr;
 
  public:
-  HandleWrapper(Handle* handle) : handle_(handle) {}
-  HandleWrapper(HandleWrapper&& hw);
-  ~HandleWrapper();
-
+  explicit HandleWrapper(Handle* handle = nullptr) : handle_(handle) {}
   HandleWrapper(const HandleWrapper&) = delete;
   HandleWrapper& operator=(const HandleWrapper&) = delete;
-  HandleWrapper& operator=(HandleWrapper&&);
-
-  auto Get() -> Handle& { return *handle_; }
-  auto Done() const -> bool { return handle_ == nullptr || handle_->Done(); }
-};
-
-class HandlePool {
-  friend Handle;
-  friend HandleWrapper;
-
- private:
-  std::mutex mu_;
-  Handle dummy_;
-  Handle pool_[kHandlePoolSize];
-  HandlePool();
-  static auto Instance() -> HandlePool&;
-  static auto Release(Handle* handle) -> void;
-
- public:
-  // get a handle from the pool.
-  // the handle will be released when the wrapper is dropped.
-  static auto Acquire() -> HandleWrapper;
+  HandleWrapper(HandleWrapper&& hw) {
+    handle_ = hw.handle_;
+    hw.handle_ = nullptr;
+  }
+  HandleWrapper& operator=(HandleWrapper&& hw) {
+    if (handle_ != nullptr) {
+      handle_->Wait();
+      delete handle_;
+    }
+    handle_ = hw.handle_;
+    hw.handle_ = nullptr;
+    return *this;
+  }
+  ~HandleWrapper() {
+    if (handle_ != nullptr) {
+      handle_->Wait();
+      delete handle_;
+    }
+  }
+  auto operator*() -> Handle* { return handle_; }
+  auto operator->() -> Handle* { return handle_; }
 };
 
 // for direct io only.
@@ -110,11 +113,9 @@ class IoUring {
   IoUring(IoUring&&) = delete;
   ~IoUring();
   auto DoIoReq(const IoReq& req) -> HandleWrapper;
-  auto DoIoReqSync(const IoReq& req) -> void { DoIoReq(req); }
+  auto DoIoReqSync(const IoReq& req) -> Status;
   auto BatchIoReq(const std::vector<IoReq>& reqs) -> std::vector<HandleWrapper>;
-  auto BatchIoReqSync(const std::vector<IoReq>& reqs) -> void {
-    BatchIoReq(reqs);
-  }
+  auto BatchIoReqSync(const std::vector<IoReq>& reqs) -> std::vector<Status>;
 
   auto PollAndHandleCQE() -> void;
   auto TryPollAndHandleCQE() -> bool;

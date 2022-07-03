@@ -23,10 +23,10 @@ auto HeapFile::Open(const Options* options, const std::string& dbname,
   std::string filename = HeapFileName(dbname, file_number);
   if (!options->env->FileExists(filename)) {
     exist = false;
-    fd = ::open(filename.c_str(), O_CREAT | O_RDWR | O_DIRECT | O_SYNC, 0644);
+    fd = ::open(filename.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0644);
     ret = ::fallocate(fd, 0, 0, kHeapFileSize);
   } else {
-    fd = ::open(filename.c_str(), O_RDWR | O_DIRECT | O_SYNC);
+    fd = ::open(filename.c_str(), O_RDWR | O_DIRECT);
   }
 
   if (fd < 0) {
@@ -44,10 +44,13 @@ auto HeapFile::Open(const Options* options, const std::string& dbname,
   ret = ::posix_memalign(reinterpret_cast<void**>(&super_block), kHeapBlockSize,
                          kHeapBlockSize);
   assert(ret == 0);
-  {
-    auto hw = IoUring::Instance().DoIoReq(
-        IoReq(false, fd, kHeapBlockSize, kSuperBlockOffset,
-              reinterpret_cast<uint8_t*>(super_block)));
+
+  Status s;
+  s = IoUring::Instance().DoIoReqSync(
+      IoReq(false, fd, kHeapBlockSize, kSuperBlockOffset,
+            reinterpret_cast<uint8_t*>(super_block)));
+  if (!s.ok()) {
+    return s;
   }
 
   if (exist) {
@@ -59,9 +62,12 @@ auto HeapFile::Open(const Options* options, const std::string& dbname,
       super_block->bitmap[i] = 0;
     }
     super_block->SetCheckSum();
-    auto hw = IoUring::Instance().DoIoReq(
+    s = IoUring::Instance().DoIoReqSync(
         IoReq(true, fd, kHeapBlockSize, kSuperBlockOffset,
               reinterpret_cast<uint8_t*>(super_block)));
+    if (!s.ok()) {
+      return s;
+    }
   }
 
   *heap_file = std::unique_ptr<HeapFile>(
@@ -164,11 +170,9 @@ auto HeapFile::SetBitmapAndFlush(const std::vector<Mutation>& mutations)
   }
   super_block_->SetCheckSum();
 
-  auto hw = IoUring::Instance().DoIoReq(
+  return IoUring::Instance().DoIoReqSync(
       IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
             reinterpret_cast<uint8_t*>(super_block_)));
-  hw.Get().Wait();
-  return hw.Get().status();
 }
 
 auto HeapFile::UnSetBitmapAndFlush(const std::vector<Mutation>& mutations)
@@ -182,11 +186,9 @@ auto HeapFile::UnSetBitmapAndFlush(const std::vector<Mutation>& mutations)
   }
   super_block_->SetCheckSum();
 
-  auto hw = IoUring::Instance().DoIoReq(
+  return IoUring::Instance().DoIoReqSync(
       IoReq(true, fd_, kHeapBlockSize, kSuperBlockOffset,
             reinterpret_cast<uint8_t*>(super_block_)));
-  hw.Get().Wait();
-  return hw.Get().status();
 }
 
 auto HeapFile::InitFreeBlockList() -> void {
@@ -216,6 +218,12 @@ auto HeapFile::InitFreeBlockList() -> void {
       start_index = kInvalidBitMapIndex;
       block_count = 0;
     }
+  }
+  if (start_index != kInvalidBitMapIndex) {
+    auto node = new FreeNode(start_index, block_count);
+    auto dummy = &dummys_[CalcFreeListIndex(block_count)];
+    node->next = dummy->next;
+    dummy->next = node;
   }
 }
 

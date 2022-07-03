@@ -11,6 +11,8 @@
 #include <mutex>
 #include <vector>
 
+#include "leveldb/status.h"
+
 namespace leveldb {
 
 auto Handle::Init(IoUring* ring, const IoReq& req) -> void {
@@ -54,77 +56,6 @@ auto Handle::Wait() -> void {
   while (!done_) {
     inst.PollAndHandleCQE();
   }
-}
-
-HandleWrapper::HandleWrapper(HandleWrapper&& hw) {
-  assert(handle_ == nullptr);
-  handle_ = hw.handle_;
-  hw.handle_ = nullptr;
-}
-
-HandleWrapper::~HandleWrapper() {
-  if (handle_ != nullptr) {
-    handle_->Wait();
-    HandlePool::Release(handle_);
-    handle_ = nullptr;
-  }
-}
-
-HandleWrapper& HandleWrapper::operator=(HandleWrapper&& hw) {
-  if (handle_ != nullptr) {
-    handle_->Wait();
-    HandlePool::Release(handle_);
-    handle_ = nullptr;
-  }
-  handle_ = hw.handle_;
-  hw.handle_ = nullptr;
-  return *this;
-}
-
-auto HandlePool::Instance() -> HandlePool& {
-  static HandlePool inst;
-  return inst;
-}
-
-HandlePool::HandlePool() {
-  memset(pool_, 0, sizeof(pool_));
-  dummy_.next_ = &pool_[0];
-  pool_[0].fixed_ = true;
-  for (size_t i = 1; i < kHandlePoolSize; i++) {
-    pool_[i].fixed_ = true;
-    pool_[i - 1].next_ = &pool_[i];
-  }
-}
-
-auto HandlePool::Release(Handle* handle) -> void {
-  auto& hp = Instance();
-  assert(handle != nullptr);
-  if (!handle->fixed_) {
-    delete handle;
-    return;
-  }
-  memset(handle, 0, sizeof(*handle));
-  handle->fixed_ = true;
-  std::lock_guard<std::mutex> lk(hp.mu_);
-  handle->next_ = hp.dummy_.next_;
-  hp.dummy_.next_ = handle;
-}
-
-auto HandlePool::Acquire() -> HandleWrapper {
-  auto& hp = Instance();
-  Handle* handle = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(hp.mu_);
-    if (hp.dummy_.next_ != nullptr) {
-      handle = hp.dummy_.next_;
-      hp.dummy_.next_ = handle->next_;
-    }
-  }
-  if (handle == nullptr) {
-    handle = new Handle();
-    handle->fixed_ = false;
-  }
-  return HandleWrapper(handle);
 }
 
 auto IoUring::Instance() -> IoUring& {
@@ -171,14 +102,20 @@ auto IoUring::DoIoReq(const IoReq& req) -> HandleWrapper {
     PollAndHandleCQE();
   }
 
-  HandleWrapper hw = HandlePool::Acquire();
-  hw.Get().Init(this, req);
+  Handle* h = new Handle();
+  h->Init(this, req);
   io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
   assert(sqe != nullptr);  // we limit in_flight_ to depth_
-  hw.Get().PrepSqe(sqe);
+  h->PrepSqe(sqe);
   auto num = io_uring_submit(&io_uring_);
   in_flight_++;
-  return hw;
+  return HandleWrapper(h);
+}
+
+auto IoUring::DoIoReqSync(const IoReq& req) -> Status {
+  HandleWrapper hw = DoIoReq(req);
+  hw->Wait();
+  return hw->status();
 }
 
 auto IoUring::BatchIoReq(const std::vector<IoReq>& reqs)
@@ -196,16 +133,30 @@ auto IoUring::BatchIoReq(const std::vector<IoReq>& reqs)
   std::vector<HandleWrapper> hws;
   hws.reserve(reqs.size());
   for (const auto& req : reqs) {
-    HandleWrapper hw = HandlePool::Acquire();
-    hw.Get().Init(this, req);
+    Handle* h = new Handle();
+    h->Init(this, req);
     io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
     assert(sqe != nullptr);  // we limit in_flight_ to depth_
-    hw.Get().PrepSqe(sqe);
-    hws.push_back(std::move(hw));
+    h->PrepSqe(sqe);
+    hws.emplace_back(h);
   }
   io_uring_submit(&io_uring_);
   in_flight_ += reqs.size();
   return hws;
+}
+
+auto IoUring::BatchIoReqSync(const std::vector<IoReq>& reqs)
+    -> std::vector<Status> {
+  std::vector<HandleWrapper> hws = BatchIoReq(reqs);
+  for (auto& hw : hws) {
+    hw->Wait();
+  }
+  std::vector<Status> statuses;
+  statuses.reserve(reqs.size());
+  for (auto& hw : hws) {
+    statuses.push_back(std::move(hw->status()));
+  }
+  return statuses;
 }
 
 auto IoUring::PollAndHandleCQE() -> void {

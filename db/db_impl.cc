@@ -4,14 +4,6 @@
 
 #include "db/db_impl.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -22,11 +14,20 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -34,6 +35,9 @@
 #include "util/coding.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
+
+#include "heapfile/heapfile_manager.h"
+#include "heapfile/heapfile_value.h"
 
 namespace leveldb {
 
@@ -133,6 +137,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+      heapfile_manager_(new HeapFileManager(dbname, env_, options_)),
       db_lock_(nullptr),
       shutting_down_(false),
       background_work_finished_signal_(&mutex_),
@@ -147,7 +152,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               heapfile_manager_, &internal_comparator_)) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -169,6 +174,7 @@ DBImpl::~DBImpl() {
   delete log_;
   delete logfile_;
   delete table_cache_;
+  delete heapfile_manager_;
 
   if (owns_info_log_) {
     delete options_.info_log;
@@ -264,6 +270,7 @@ void DBImpl::RemoveObsoleteFiles() {
         case kCurrentFile:
         case kDBLockFile:
         case kInfoLogFile:
+        case kHeapFile:
           keep = true;
           break;
       }
@@ -286,6 +293,7 @@ void DBImpl::RemoveObsoleteFiles() {
   for (const std::string& filename : files_to_delete) {
     env_->RemoveFile(dbname_ + "/" + filename);
   }
+  heapfile_manager_->CheckCompactTxnDone(live);
   mutex_.Lock();
 }
 
@@ -516,7 +524,8 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
-    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    s = BuildTable(dbname_, env_, options_, table_cache_, heapfile_manager_,
+                   iter, &meta, true);
     mutex_.Lock();
   }
 
@@ -913,6 +922,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   mutex_.Unlock();
 
   input->SeekToFirst();
+  HeapFileManager::CompactTxn txn =
+      heapfile_manager_->NewCompactTxn(compact->compaction);
   Status status;
   ParsedInternalKey ikey;
   std::string current_user_key;
@@ -1008,6 +1019,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
           break;
         }
       }
+    } else {
+      if (ikey.type == kTypeHFValue) {
+        HFValueMeta meta;
+        Slice v(input->value());
+        meta.DecodeFrom(v);
+        txn.Remove(meta);
+      }
     }
 
     input->Next();
@@ -1042,8 +1060,14 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   if (status.ok()) {
     status = InstallCompactionResults(compact);
   }
+  if (status.ok()) {
+    heapfile_manager_->AddPendingCompactTxn(std::move(txn));
+    // TODO: make this in a more nice way.
+    txn.Abort();  // move to manager for commit
+  }
   if (!status.ok()) {
     RecordBackgroundError(status);
+    txn.Abort();
   }
   VersionSet::LevelSummaryStorage tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));

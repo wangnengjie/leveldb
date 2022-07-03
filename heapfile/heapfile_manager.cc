@@ -1,11 +1,16 @@
 #include "heapfile_manager.h"
 
 #include "db/filename.h"
+#include "db/version_set.h"
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <utility>
+#include <vector>
 
+#include "leveldb/env.h"
 #include "leveldb/status.h"
 
 #include "util/io_uring.h"
@@ -17,7 +22,27 @@ namespace leveldb {
 
 HeapFileManager::HeapFileManager(const std::string& dbname, Env* env,
                                  const Options& options)
-    : dbname_(dbname), env_(env), options_(options), next_txn_id_(0) {}
+    : dbname_(dbname),
+      env_(env),
+      options_(options),
+      next_txn_id_(1),
+      next_hf_number_(1) {
+  std::vector<std::string> filenames;
+  env_->GetChildren(dbname_, &filenames);  // Ignoring errors on purpose
+  uint64_t number;
+  FileType type;
+  for (auto& filename : filenames) {
+    if (ParseFileName(filename, &number, &type) && type == kHeapFile) {
+      next_hf_number_ = std::max(next_hf_number_, number + 1);
+      AddHeapFile(number);
+    }
+  }
+  SortHeapFile();
+}
+
+HeapFileManager::~HeapFileManager() {
+  // TODO: for compact txn check
+}
 
 auto HeapFileManager::AddHeapFile(uint64_t file_number) -> Status {
   std::lock_guard<std::mutex> l(mu_);
@@ -36,6 +61,11 @@ auto HeapFileManager::AddHeapFile(uint64_t file_number) -> Status {
   }
   hfs_map_.emplace(file_number, std::move(hf));
   return s;
+}
+
+auto HeapFileManager::AddNewHeapFile() -> Status {
+  uint64_t fn = NextHFNumber();
+  return AddHeapFile(fn);
 }
 
 auto HeapFileManager::GetHeapFile(uint64_t file_number) const
@@ -57,31 +87,52 @@ auto HeapFileManager::GetHeapFile(uint64_t file_number) -> HeapFile* {
   return it->second.get();
 }
 
-auto HeapFileManager::ReadValue(uint64_t file_number, uint16_t start_index,
-                                uint16_t block_count, uint8_t* buf,
-                                HandleWrapper& hw) -> Status {
-  const HeapFile* hf = GetHeapFile(file_number);
+auto HeapFileManager::ReadHFValue(const HFValueMeta& meta, uint8_t* buf,
+                                  HandleWrapper& h) -> Status {
+  const HeapFile* hf = GetHeapFile(meta.file_number);
   if (hf == nullptr) {
     return Status::NotFound("HeapFile not found");
   }
-  hw = std::move(IoUring::Instance().DoIoReq(
-      IoReq(false, hf->Fd(), block_count * kHeapBlockSize,
-            start_index * kHeapBlockSize, buf)));
+  h = IoUring::Instance().DoIoReq(
+      IoReq(false, hf->Fd(), meta.block_count * kHeapBlockSize,
+            meta.start_index * kHeapBlockSize, buf));
   return Status::OK();
 }
 
-auto HeapFileManager::ReadValueSync(uint64_t file_number, uint16_t start_index,
-                                    uint16_t block_count, uint8_t* buf)
+auto HeapFileManager::ReadHFValueSync(const HFValueMeta& meta, uint8_t* buf)
     -> Status {
-  const HeapFile* hf = GetHeapFile(file_number);
+  const HeapFile* hf = GetHeapFile(meta.file_number);
   if (hf == nullptr) {
     return Status::NotFound("HeapFile not found");
   }
-  auto hw = IoUring::Instance().DoIoReq(
-      IoReq(false, hf->Fd(), block_count * kHeapBlockSize,
-            start_index * kHeapBlockSize, buf));
-  hw.Get().Wait();
-  return std::move(hw.Get().status());
+  return IoUring::Instance().DoIoReqSync(
+      IoReq(false, hf->Fd(), meta.block_count * kHeapBlockSize,
+            meta.start_index * kHeapBlockSize, buf));
+}
+
+auto HeapFileManager::ReadDecodedValueSync(const HFValueMeta& meta,
+                                           std::string& value) -> Status {
+  Status s;
+  uint8_t* hf_buf = nullptr;
+  int ret = ::posix_memalign(reinterpret_cast<void**>(&hf_buf), kHeapBlockSize,
+                             meta.block_count * kHeapBlockSize);
+  assert(ret == 0);
+  s = ReadHFValueSync(meta, hf_buf);
+  if (!s.ok()) {
+    delete hf_buf;
+    return s;
+  }
+  size_t size = 0;
+  s = GetHFValueDecodeLength(hf_buf, &size);
+  if (!s.ok()) {
+    delete hf_buf;
+    return s;
+  }
+  value.resize(size);
+  s = DecodeHFValue(hf_buf, meta.block_count * kHeapBlockSize,
+                    reinterpret_cast<uint8_t*>(value.data()));
+  delete hf_buf;
+  return s;
 }
 
 auto HeapFileManager::SortHeapFile() -> void {
@@ -94,11 +145,45 @@ auto HeapFileManager::SortHeapFile() -> void {
 
 auto HeapFileManager::NewFlushTxn() -> FlushTxn { return FlushTxn(this); }
 
-auto HeapFileManager::NewCompactTxn() -> CompactTxn { return CompactTxn(this); }
+auto HeapFileManager::NewCompactTxn(const Compaction* compaction)
+    -> CompactTxn {
+  return CompactTxn(this, compaction);
+}
+
+auto HeapFileManager::AddPendingCompactTxn(CompactTxn&& txn) -> void {
+  std::lock_guard<std::mutex> l(compact_mu_);
+  pending_compact_txns_.push_back(std::move(txn));
+}
+
+auto HeapFileManager::CheckCompactTxnDone(const std::set<uint64_t>& live)
+    -> void {
+  std::lock_guard<std::mutex> l(compact_mu_);
+  for (auto it = pending_compact_txns_.begin();
+       it != pending_compact_txns_.end();) {
+    bool to_commit = true;
+    for (const auto& fn : it->RelateFiles()) {
+      if (live.find(fn) != live.end()) {
+        to_commit = false;
+        break;
+      }
+    }
+    if (to_commit) {
+      it->Commit();
+      it = pending_compact_txns_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
 
 auto HeapFileManager::NextTxnId() -> uint64_t {
   std::lock_guard<std::mutex> l(mu_);
   return next_txn_id_++;
+}
+
+auto HeapFileManager::NextHFNumber() -> uint64_t {
+  std::lock_guard<std::mutex> l(mu_);
+  return next_hf_number_++;
 }
 
 using FlushTxn = HeapFileManager::FlushTxn;
@@ -108,49 +193,55 @@ FlushTxn::FlushTxn(HeapFileManager* hfm)
       hfm_(hfm),
       pinned_hf_(nullptr),
       io_count_(0),
-      batch_size_(kIoUringDepth / 2),
       status_(TxnStatus::kRunning) {
-  io_bufs_.resize(batch_size_ * 2, IoBuf{.size = 0, .buf = nullptr});
-  submit_handles_.reserve(batch_size_);
+  submit_handles_.resize(kIoUringDepth);
+  io_bufs_.resize(kIoUringDepth, IoBuf{.size = 0, .buf = nullptr});
 }
 
-auto FlushTxn::Add(Slice& s, HFValueMeta& value_meta) -> Status {
+auto FlushTxn::Add(const Slice& s, HFValueMeta& value_meta) -> Status {
   if (status_ != TxnStatus::kRunning) {
     return Status::HFError("FlushTxn is not running");
   }
 
   Status status;
-  size_t cur_buf_index = io_count_ % (batch_size_ * 2);
+  size_t cur_index = io_count_ % kIoUringDepth;
+
+  if (*submit_handles_[cur_index] != nullptr) {
+    submit_handles_[cur_index]->Wait();
+  }
+
   size_t max_len = HFValueMaxEncodedLength(hfm_->options_, s.size());
   max_len = round_up(max_len);
 
-  status = PrepareBuf(cur_buf_index, max_len);
+  status = PrepareBuf(cur_index, max_len);
   if (!status.ok()) {
     return status;
   }
 
   size_t output_size;
-  EncodeHFValue(hfm_->options_, s, io_bufs_[cur_buf_index].buf, &output_size);
+  EncodeHFValue(hfm_->options_, s, io_bufs_[cur_index].buf, &output_size);
   output_size = round_up(output_size);
+  assert(output_size == 4096);
   Mutation m = FindSpace(output_size);
-  if (m.Offset() == kInvalidOffset) {
-    return Status::HFNoSpace();
+  while (m.Offset() == kInvalidOffset) {
+    status = hfm_->AddNewHeapFile();
+    if (!status.ok()) {
+      return status;
+    }
+    hfm_->SortHeapFile();
+    m = FindSpace(output_size);
   }
 
-  batch_.emplace_back(true, pinned_hf_->Fd(), output_size, m.Offset(),
-                      io_bufs_[cur_buf_index].buf);
+  submit_handles_[cur_index] = std::move(
+      IoUring::Instance().DoIoReq(IoReq(true, pinned_hf_->Fd(), output_size,
+                                        m.Offset(), io_bufs_[cur_index].buf)));
+
   mutations_[pinned_hf_->FileNumber()].push_back(m);
 
   value_meta.file_number = pinned_hf_->FileNumber();
   value_meta.start_index = m.StartIndex();
   value_meta.block_count = m.BlockCount();
 
-  // current batch is full, submit it
-  // 1. wait for previous batch to finish
-  // 2. submit current batch
-  if (batch_.size() == batch_size_) {
-    status = SubmitBatch();
-  }
   io_count_++;
   return status;
 }
@@ -160,17 +251,17 @@ auto FlushTxn::Commit() -> Status {
     return Status::HFError("FlushTxn is not running");
   }
   Status s;
-  if (batch_.size() > 0) {
-    s = SubmitBatch();
-    if (!s.ok()) {
-      return s;
+
+  for (auto& hw : submit_handles_) {
+    if (*hw == nullptr) {
+      continue;
+    }
+    hw->Wait();
+    if (!hw->status().ok()) {
+      return hw->status();
     }
   }
-  s = WaitPrevBatch();
-  if (!s.ok()) {
-    return s;
-  }
-  assert(submit_handles_.size() == 0);
+
   for (auto& [file_number, mutations] : mutations_) {
     HeapFile* hf = hfm_->GetHeapFile(file_number);
     assert(hf != nullptr);
@@ -189,7 +280,16 @@ auto FlushTxn::Abort() -> Status {
   if (status_ != TxnStatus::kRunning) {
     return Status::HFError("FlushTxn is not running");
   }
-  Status s = WaitPrevBatch();
+  Status s;
+  for (auto& hw : submit_handles_) {
+    if (*hw == nullptr) {
+      continue;
+    }
+    hw->Wait();
+    if (!hw->status().ok()) {
+      s = hw->status();
+    }
+  }
   for (auto& [file_number, mutations] : mutations_) {
     HeapFile* hf = hfm_->GetHeapFile(file_number);
     assert(hf != nullptr);
@@ -197,13 +297,6 @@ auto FlushTxn::Abort() -> Status {
   }
   status_ = TxnStatus::kAborted;
   hfm_->SortHeapFile();
-  return s;
-}
-
-auto FlushTxn::SubmitBatch() -> Status {
-  Status s = WaitPrevBatch();
-  submit_handles_ = IoUring::Instance().BatchIoReq(batch_);
-  batch_.clear();
   return s;
 }
 
@@ -236,18 +329,6 @@ auto FlushTxn::FindSpace(size_t size) -> Mutation {
   return m;
 }
 
-auto FlushTxn::WaitPrevBatch() -> Status {
-  Status s;
-  for (auto& h : submit_handles_) {
-    h.Get().Wait();
-    if (!h.Get().status().ok()) {
-      s = h.Get().status();
-    }
-  }
-  submit_handles_.clear();
-  return s;
-}
-
 auto FlushTxn::PrepareBuf(size_t index, size_t size) -> Status {
   if (io_bufs_[index].size < size) {
     delete[] io_bufs_[index].buf;
@@ -272,8 +353,18 @@ FlushTxn::~FlushTxn() {
 
 using CompactTxn = HeapFileManager::CompactTxn;
 
-CompactTxn::CompactTxn(HeapFileManager* hfm)
-    : txn_id_(hfm->NextTxnId()), hfm_(hfm), status_(TxnStatus::kRunning) {}
+CompactTxn::CompactTxn(HeapFileManager* hfm, const Compaction* compaction)
+    : txn_id_(hfm->NextTxnId()), hfm_(hfm), status_(TxnStatus::kRunning) {
+  int files;
+  files = compaction->num_input_files(0);
+  for (int i = 0; i < files; i++) {
+    relate_files_.push_back(compaction->input(0, i)->number);
+  }
+  files = compaction->num_input_files(1);
+  for (int i = 0; i < files; i++) {
+    relate_files_.push_back(compaction->input(1, i)->number);
+  }
+}
 
 CompactTxn::~CompactTxn() {
   if (status_ == TxnStatus::kRunning) {
